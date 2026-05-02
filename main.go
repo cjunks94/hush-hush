@@ -215,8 +215,7 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "decrypt failed")
 		return
 	}
-	// AAD = name; rebinding ciphertext to a different row is rejected.
-	pt, err := s.gcm.Open(nil, nonce, ct[1:], []byte(name))
+	pt, err := s.gcm.Open(nil, nonce, ct[1:], aad(name))
 	if err != nil {
 		log.Printf("decrypt %q: %v", name, err)
 		writeErr(w, http.StatusInternalServerError, "decrypt failed")
@@ -270,8 +269,9 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 1-byte version prefix lets us migrate algorithms later without
-	// losing access to existing rows.
-	ct := append([]byte{cryptoVersion}, s.gcm.Seal(nil, nonce, []byte(in.Value), []byte(name))...)
+	// losing access to existing rows. Version is also bound into AAD
+	// so flipping the prefix byte is rejected by the AEAD tag.
+	ct := append([]byte{cryptoVersion}, s.gcm.Seal(nil, nonce, []byte(in.Value), aad(name))...)
 
 	now := time.Now().Unix()
 	var createdAt int64
@@ -302,15 +302,12 @@ func (s *server) del(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid name")
 		return
 	}
-	res, err := s.db.ExecContext(r.Context(), `DELETE FROM secrets WHERE name = ?`, name)
-	if err != nil {
+	// Idempotent: a network retry of a successful DELETE should not
+	// surface as an error. We don't distinguish "deleted" from "wasn't
+	// there" — both end states are identical.
+	if _, err := s.db.ExecContext(r.Context(), `DELETE FROM secrets WHERE name = ?`, name); err != nil {
 		log.Printf("delete exec: %v", err)
 		writeErr(w, http.StatusInternalServerError, "db error")
-		return
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -318,8 +315,22 @@ func (s *server) del(w http.ResponseWriter, r *http.Request) {
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
+	// Defense in depth against any CDN (Fastly sits in front on Railway)
+	// caching authenticated responses.
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// aad binds both the secret name AND the ciphertext version into the AEAD
+// associated data. Name binding prevents row-rebinding (moving ciphertext
+// between names); version binding prevents algorithm-downgrade attacks if
+// a future cryptoVersion is introduced.
+func aad(name string) []byte {
+	out := make([]byte, 0, 1+len(name))
+	out = append(out, cryptoVersion)
+	out = append(out, name...)
+	return out
 }
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
