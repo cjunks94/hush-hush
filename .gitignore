@@ -1,0 +1,10 @@
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+hush-hush
+hush-hush.exe
+/dist/
+/tmp/
