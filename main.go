@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
@@ -13,24 +15,28 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 const (
-	maxValueBytes = 64 * 1024
-	maxBodyBytes  = maxValueBytes + 1024
+	maxValueBytes      = 64 * 1024
+	maxBodyBytes       = maxValueBytes + 1024
+	shutdownGrace      = 10 * time.Second
+	cryptoVersion byte = 0x01
 )
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,128}$`)
 
 type server struct {
-	db        *sql.DB
-	gcm       cipher.AEAD
-	authToken []byte
+	db            *sql.DB
+	gcm           cipher.AEAD
+	authTokenHash [32]byte
 }
 
 type secretRow struct {
@@ -63,17 +69,25 @@ func main() {
 		log.Fatalf("gcm init: %v", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
+	db, err := sql.Open("sqlite",
+		dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		log.Fatalf("sqlite open: %v", err)
 	}
 	defer db.Close()
+	// SQLite serializes writers; capping the pool at 1 avoids spurious
+	// SQLITE_BUSY at the database/sql layer for a single-user workload.
+	db.SetMaxOpenConns(1)
 
 	if err := initSchema(db); err != nil {
 		log.Fatalf("schema: %v", err)
 	}
 
-	s := &server{db: db, gcm: gcm, authToken: []byte(token)}
+	s := &server{
+		db:            db,
+		gcm:           gcm,
+		authTokenHash: sha256.Sum256([]byte(token)),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
@@ -90,8 +104,25 @@ func main() {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	log.Printf("hush-hush listening on :%s (db=%s)", port, dbPath)
-	log.Fatal(srv.ListenAndServe())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("hush-hush listening on :%s (db=%s)", port, dbPath)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("listen: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutdown: draining connections")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
+	log.Println("shutdown: done")
 }
 
 func initSchema(db *sql.DB) error {
@@ -114,8 +145,12 @@ func (s *server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, "missing bearer token")
 			return
 		}
-		given := []byte(strings.TrimPrefix(auth, "Bearer "))
-		if subtle.ConstantTimeCompare(given, s.authToken) != 1 {
+		// Hash both sides so the compared slices are always 32 bytes;
+		// ConstantTimeCompare short-circuits on length mismatch and would
+		// otherwise leak the real token's length via timing.
+		given := strings.TrimPrefix(auth, "Bearer ")
+		givenHash := sha256.Sum256([]byte(given))
+		if subtle.ConstantTimeCompare(givenHash[:], s.authTokenHash[:]) != 1 {
 			writeErr(w, http.StatusUnauthorized, "invalid token")
 			return
 		}
@@ -147,6 +182,11 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, sr)
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("list rows: %v", err)
+		writeErr(w, http.StatusInternalServerError, "db error")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"secrets": out})
 }
 
@@ -170,8 +210,13 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
 	}
+	if len(ct) < 1 || ct[0] != cryptoVersion {
+		log.Printf("get %q: unsupported ciphertext version", name)
+		writeErr(w, http.StatusInternalServerError, "decrypt failed")
+		return
+	}
 	// AAD = name; rebinding ciphertext to a different row is rejected.
-	pt, err := s.gcm.Open(nil, nonce, ct, []byte(name))
+	pt, err := s.gcm.Open(nil, nonce, ct[1:], []byte(name))
 	if err != nil {
 		log.Printf("decrypt %q: %v", name, err)
 		writeErr(w, http.StatusInternalServerError, "decrypt failed")
@@ -191,9 +236,16 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid name")
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	// Read one byte beyond the cap so an oversized body returns a clear
+	// "too large" error instead of a confusing "invalid json" from a
+	// silently truncated payload.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "read body")
+		return
+	}
+	if len(body) > maxBodyBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
 	}
 	var in struct {
@@ -208,7 +260,7 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(in.Value) > maxValueBytes {
-		writeErr(w, http.StatusBadRequest, "value too large")
+		writeErr(w, http.StatusRequestEntityTooLarge, "value too large")
 		return
 	}
 
@@ -217,23 +269,31 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "rng failed")
 		return
 	}
-	ct := s.gcm.Seal(nil, nonce, []byte(in.Value), []byte(name))
+	// 1-byte version prefix lets us migrate algorithms later without
+	// losing access to existing rows.
+	ct := append([]byte{cryptoVersion}, s.gcm.Seal(nil, nonce, []byte(in.Value), []byte(name))...)
 
 	now := time.Now().Unix()
-	_, err = s.db.ExecContext(r.Context(), `
+	var createdAt int64
+	err = s.db.QueryRowContext(r.Context(), `
 		INSERT INTO secrets (name, ciphertext, nonce, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET
 			ciphertext = excluded.ciphertext,
 			nonce      = excluded.nonce,
 			updated_at = excluded.updated_at
-	`, name, ct, nonce, now, now)
+		RETURNING created_at
+	`, name, ct, nonce, now, now).Scan(&createdAt)
 	if err != nil {
 		log.Printf("put exec: %v", err)
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"name": name, "updated_at": now})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":       name,
+		"created_at": createdAt,
+		"updated_at": now,
+	})
 }
 
 func (s *server) del(w http.ResponseWriter, r *http.Request) {
