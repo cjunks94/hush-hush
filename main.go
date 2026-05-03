@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -12,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -30,6 +32,9 @@ const (
 	maxBodyBytes       = maxValueBytes + 1024
 	shutdownGrace      = 10 * time.Second
 	cryptoVersion byte = 0x01
+	// listLimit caps the LIST response to bound memory for accidental
+	// bulk imports. Personal scale should never approach this.
+	listLimit = 1000
 )
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,128}$`)
@@ -189,7 +194,8 @@ func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 
 func (s *server) list(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(r.Context(),
-		`SELECT name, created_at, updated_at FROM secrets ORDER BY name`)
+		`SELECT name, created_at, updated_at FROM secrets ORDER BY name LIMIT ?`,
+		listLimit)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "list query failed", "error", err)
 		writeErr(w, http.StatusInternalServerError, "db error")
@@ -241,7 +247,11 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ct[0] != cryptoVersion {
-		slog.ErrorContext(r.Context(), "unsupported ciphertext version", "name", name, "version", ct[0])
+		slog.ErrorContext(r.Context(), "unsupported ciphertext version",
+			"name", name,
+			"version", fmt.Sprintf("0x%02x", ct[0]),
+			"expected", fmt.Sprintf("0x%02x", cryptoVersion),
+		)
 		writeErr(w, http.StatusInternalServerError, "decrypt failed")
 		return
 	}
@@ -280,8 +290,17 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Value string `json:"value"`
 	}
-	if err := json.Unmarshal(body, &in); err != nil {
+	// Strict JSON: reject unknown fields (so a future struct change can't
+	// be silently mass-assigned) and reject trailing bytes after the
+	// object (so a malformed body can't slip through past a valid prefix).
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if dec.More() {
+		writeErr(w, http.StatusBadRequest, "trailing data after json")
 		return
 	}
 	if in.Value == "" {

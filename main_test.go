@@ -159,6 +159,13 @@ func TestPut_BodyValidation(t *testing.T) {
 		{"missing value field", `{}`, http.StatusBadRequest},
 		{"malformed json", `not json`, http.StatusBadRequest},
 		{"valid", `{"value":"x"}`, http.StatusOK},
+		// Strict JSON: unknown fields rejected so a future struct change
+		// can't be silently mass-assigned.
+		{"unknown field rejected", `{"value":"x","admin":true}`, http.StatusBadRequest},
+		// Trailing data after a valid object rejected so a malformed
+		// body can't slip past a valid prefix.
+		{"trailing junk after object", `{"value":"x"}JUNK`, http.StatusBadRequest},
+		{"trailing second object", `{"value":"x"}{"value":"y"}`, http.StatusBadRequest},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
