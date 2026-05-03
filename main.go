@@ -60,15 +60,6 @@ func main() {
 		log.Fatalf("MASTER_KEY: must decode to 32 bytes, got %d", len(key))
 	}
 
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		log.Fatalf("aes init: %v", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		log.Fatalf("gcm init: %v", err)
-	}
-
 	db, err := sql.Open("sqlite",
 		dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
@@ -83,22 +74,14 @@ func main() {
 		log.Fatalf("schema: %v", err)
 	}
 
-	s := &server{
-		db:            db,
-		gcm:           gcm,
-		authTokenHash: sha256.Sum256([]byte(token)),
+	s, err := newServer(db, key, token)
+	if err != nil {
+		log.Fatalf("server init: %v", err)
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("GET /v1/secrets", s.requireAuth(s.list))
-	mux.HandleFunc("GET /v1/secrets/{name}", s.requireAuth(s.get))
-	mux.HandleFunc("PUT /v1/secrets/{name}", s.requireAuth(s.put))
-	mux.HandleFunc("DELETE /v1/secrets/{name}", s.requireAuth(s.del))
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           mux,
+		Handler:           s.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -123,6 +106,35 @@ func main() {
 		log.Printf("shutdown: %v", err)
 	}
 	log.Println("shutdown: done")
+}
+
+// newServer constructs a server from already-validated dependencies.
+// Extracted from main() so tests can build a server against an in-memory
+// database without parsing env vars or duplicating crypto setup.
+func newServer(db *sql.DB, key []byte, token string) (*server, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return &server{
+		db:            db,
+		gcm:           gcm,
+		authTokenHash: sha256.Sum256([]byte(token)),
+	}, nil
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.health)
+	mux.HandleFunc("GET /v1/secrets", s.requireAuth(s.list))
+	mux.HandleFunc("GET /v1/secrets/{name}", s.requireAuth(s.get))
+	mux.HandleFunc("PUT /v1/secrets/{name}", s.requireAuth(s.put))
+	mux.HandleFunc("DELETE /v1/secrets/{name}", s.requireAuth(s.del))
+	return mux
 }
 
 func initSchema(db *sql.DB) error {
