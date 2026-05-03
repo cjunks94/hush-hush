@@ -9,10 +9,11 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -47,6 +48,13 @@ type secretRow struct {
 }
 
 func main() {
+	// JSON to stdout — Railway's log viewer parses it; jq-friendly locally.
+	// contextHandler picks up request_id from r.Context() so handlers don't
+	// have to thread it manually.
+	slog.SetDefault(slog.New(&contextHandler{
+		Handler: slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}),
+	}))
+
 	keyB64 := mustEnv("MASTER_KEY")
 	token := mustEnv("AUTH_TOKEN")
 	dbPath := getenv("DB_PATH", "./hush.db")
@@ -54,16 +62,16 @@ func main() {
 
 	key, err := base64.StdEncoding.DecodeString(keyB64)
 	if err != nil {
-		log.Fatalf("MASTER_KEY: invalid base64: %v", err)
+		fatal("MASTER_KEY: invalid base64", "error", err)
 	}
 	if len(key) != 32 {
-		log.Fatalf("MASTER_KEY: must decode to 32 bytes, got %d", len(key))
+		fatal("MASTER_KEY: must decode to 32 bytes", "got", len(key))
 	}
 
 	db, err := sql.Open("sqlite",
 		dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
-		log.Fatalf("sqlite open: %v", err)
+		fatal("sqlite open failed", "error", err)
 	}
 	defer db.Close()
 	// SQLite serializes writers; capping the pool at 1 avoids spurious
@@ -71,17 +79,17 @@ func main() {
 	db.SetMaxOpenConns(1)
 
 	if err := initSchema(db); err != nil {
-		log.Fatalf("schema: %v", err)
+		fatal("schema init failed", "error", err)
 	}
 
 	s, err := newServer(db, key, token)
 	if err != nil {
-		log.Fatalf("server init: %v", err)
+		fatal("server init failed", "error", err)
 	}
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           s.routes(),
+		Handler:           withRequestID(s.routes()),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -92,20 +100,20 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("hush-hush listening on :%s (db=%s)", port, dbPath)
+		slog.Info("listening", "port", port, "db_path", dbPath)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen: %v", err)
+			fatal("listen failed", "error", err)
 		}
 	}()
 
 	<-ctx.Done()
-	log.Println("shutdown: draining connections")
+	slog.Info("shutdown: draining connections", "grace", shutdownGrace.String())
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("shutdown: %v", err)
+		slog.Error("shutdown failed", "error", err)
 	}
-	log.Println("shutdown: done")
+	slog.Info("shutdown: done")
 }
 
 // newServer constructs a server from already-validated dependencies.
@@ -178,7 +186,7 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT name, created_at, updated_at FROM secrets ORDER BY name`)
 	if err != nil {
-		log.Printf("list query: %v", err)
+		slog.ErrorContext(r.Context(), "list query failed", "error", err)
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
 	}
@@ -188,14 +196,14 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var sr secretRow
 		if err := rows.Scan(&sr.Name, &sr.CreatedAt, &sr.UpdatedAt); err != nil {
-			log.Printf("list scan: %v", err)
+			slog.ErrorContext(r.Context(), "list scan failed", "error", err)
 			writeErr(w, http.StatusInternalServerError, "db error")
 			return
 		}
 		out = append(out, sr)
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("list rows: %v", err)
+		slog.ErrorContext(r.Context(), "list rows iteration failed", "error", err)
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
 	}
@@ -218,18 +226,23 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		log.Printf("get query: %v", err)
+		slog.ErrorContext(r.Context(), "get query failed", "name", name, "error", err)
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
 	}
-	if len(ct) < 1 || ct[0] != cryptoVersion {
-		log.Printf("get %q: unsupported ciphertext version", name)
+	if len(ct) < 1 {
+		slog.ErrorContext(r.Context(), "ciphertext empty", "name", name)
+		writeErr(w, http.StatusInternalServerError, "decrypt failed")
+		return
+	}
+	if ct[0] != cryptoVersion {
+		slog.ErrorContext(r.Context(), "unsupported ciphertext version", "name", name, "version", ct[0])
 		writeErr(w, http.StatusInternalServerError, "decrypt failed")
 		return
 	}
 	pt, err := s.gcm.Open(nil, nonce, ct[1:], aad(name))
 	if err != nil {
-		log.Printf("decrypt %q: %v", name, err)
+		slog.ErrorContext(r.Context(), "decrypt failed", "name", name, "error", err)
 		writeErr(w, http.StatusInternalServerError, "decrypt failed")
 		return
 	}
@@ -297,7 +310,7 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 		RETURNING created_at
 	`, name, ct, nonce, now, now).Scan(&createdAt)
 	if err != nil {
-		log.Printf("put exec: %v", err)
+		slog.ErrorContext(r.Context(), "put exec failed", "name", name, "error", err)
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
 	}
@@ -318,7 +331,7 @@ func (s *server) del(w http.ResponseWriter, r *http.Request) {
 	// surface as an error. We don't distinguish "deleted" from "wasn't
 	// there" — both end states are identical.
 	if _, err := s.db.ExecContext(r.Context(), `DELETE FROM secrets WHERE name = ?`, name); err != nil {
-		log.Printf("delete exec: %v", err)
+		slog.ErrorContext(r.Context(), "delete exec failed", "name", name, "error", err)
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
 	}
@@ -352,7 +365,7 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 func mustEnv(k string) string {
 	v := os.Getenv(k)
 	if v == "" {
-		log.Fatalf("missing required env var: %s", k)
+		fatal("missing required env var", "key", k)
 	}
 	return v
 }
@@ -362,4 +375,50 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// ---- logging / request-id middleware ----
+
+// ctxKey is unexported and unique-per-package, the canonical Go pattern
+// for stuffing values into request context without colliding.
+type ctxKey struct{}
+
+// contextHandler wraps an slog.Handler so any record logged with a
+// context-bearing call (slog.ErrorContext etc.) automatically gets the
+// request_id attribute attached. Handlers therefore don't need to
+// thread the ID through every log call manually.
+type contextHandler struct{ slog.Handler }
+
+func (h *contextHandler) Handle(ctx context.Context, r slog.Record) error {
+	if id, ok := ctx.Value(ctxKey{}).(string); ok && id != "" {
+		r.AddAttrs(slog.String("request_id", id))
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+// withRequestID generates a 16-hex-char ID for each request, stashes
+// it in the request context, and echoes it in X-Request-ID so a client
+// can correlate a server log line to the response they received.
+func withRequestID(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b := make([]byte, 8)
+		if _, err := rand.Read(b); err != nil {
+			// rand.Read failing on Linux is essentially impossible;
+			// fall through with an empty ID rather than 500-ing the request.
+			h.ServeHTTP(w, r)
+			return
+		}
+		id := hex.EncodeToString(b)
+		w.Header().Set("X-Request-ID", id)
+		ctx := context.WithValue(r.Context(), ctxKey{}, id)
+		h.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// fatal emits a structured error log line and exits 1. Used for startup
+// failures where slog's lack of Fatal-level would otherwise force every
+// caller to repeat the os.Exit(1) themselves.
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
 }
