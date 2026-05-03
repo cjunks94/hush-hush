@@ -1,0 +1,92 @@
+# CodeRabbit configuration for hush-hush.
+# Docs: https://docs.coderabbit.ai/guides/configure-coderabbit
+# Schema: https://coderabbit.ai/integrations/schema.v2.json
+
+language: en
+
+reviews:
+  # Assertive: this is a secret keeper — security trumps brevity.
+  profile: assertive
+
+  # We don't gate merges on CodeRabbit's request-changes; the security
+  # workflow + (eventually) GitHub Ruleset is the source of truth.
+  request_changes_workflow: false
+
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  # Don't burn review tokens on lockfiles or generated artifacts.
+  path_filters:
+    - "!go.sum"
+    - "!**/*.lock"
+
+  # Path-specific instructions teach CodeRabbit what matters where.
+  # Keep these tight — long instructions dilute the signal.
+  path_instructions:
+    - path: "main.go"
+      instructions: |
+        Personal self-hosted secret keeper. Server-side AES-256-GCM is
+        intentional — DO NOT flag the master-key-as-env-var design.
+        Focus on:
+          * AEAD nonce uniqueness (12-byte random per Seal)
+          * AAD binding includes BOTH cryptoVersion byte AND name —
+            any change that decouples them is a downgrade-attack vector
+          * Bearer compare uses SHA-256 + subtle.ConstantTimeCompare
+            (length leak via short-circuit is the failure mode)
+          * SQL queries are parameterized; no string concat
+          * Error messages don't leak internals (DB → "db error",
+            crypto → "decrypt failed")
+          * Cache-Control: no-store on every response (Fastly is upstream)
+          * slog uses ErrorContext so request_id flows from middleware
+        Threat model is "personal-dev-secrets" — flag any change that
+        broadens it without explicit acknowledgement.
+
+    - path: "main_test.go"
+      instructions: |
+        Table-driven where possible. Avoid time.Sleep — use the contract
+        the API actually returns (e.g. created_at preservation tested via
+        equality on returned values, not wall-clock waits).
+        Decode JSON responses into typed structs, not strings.Contains —
+        the latter is fragile to encoder formatting changes.
+
+    - path: ".github/workflows/**"
+      instructions: |
+        * Action versions on latest major (Node 24-compatible runtimes)
+        * setup-go quirk: bare "1.25" is a range spec, "1.25.0" is exact;
+          use go-version: stable for security tooling that needs latest
+          patches, go-version-file: go.mod only for the build job that
+          verifies declared-minimum compatibility
+        * GITHUB_TOKEN permissions stay minimal (contents: read default)
+        * Pin tool versions where possible — @latest can flip a green
+          branch red mid-week as new lints land
+
+    - path: ".github/dependabot.yml"
+      instructions: |
+        Grouped updates only — ungrouped Dependabot floods the queue
+        for a personal project.
+
+  # Tools CodeRabbit runs inline. Keep enabled by default; redundant
+  # with our own CI but provides per-line context in PR comments.
+  tools:
+    gosec:
+      enabled: true
+    github-checks:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  # Learn the user's preferences over time so future reviews mirror
+  # the rationale that's been established (e.g. server-side encryption
+  # is intentional, no CLI yet, deferred items list).
+  learnings:
+    scope: auto
