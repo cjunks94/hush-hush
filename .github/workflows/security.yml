@@ -57,6 +57,11 @@ jobs:
   gitleaks:
     name: gitleaks (secrets in git history)
     runs-on: ubuntu-latest
+    # Dependabot PRs only modify dependency versions — they cannot
+    # introduce committed secrets, and gitleaks-action@v2 fails on them
+    # because Dependabot's GITHUB_TOKEN is read-only and the action
+    # tries to write PR comments.
+    if: github.event_name != 'pull_request' || github.actor != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@v4
         with:
