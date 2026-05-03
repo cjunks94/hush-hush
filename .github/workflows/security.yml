@@ -14,6 +14,8 @@ permissions:
 
 jobs:
   build:
+    # Pinned to whatever go.mod declares — this job verifies the project
+    # actually compiles under its own minimum-supported Go.
     name: build + verify modules
     runs-on: ubuntu-latest
     steps:
@@ -21,27 +23,24 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          # Always grab the latest patch matching the spec — guards
-          # against Dependabot rewriting "go 1.25" to "go 1.25.0",
-          # which otherwise pins us to the unpatched .0 release.
-          check-latest: true
           cache: true
       - run: go mod verify
       - run: go build ./...
       - run: go vet ./...
 
   govulncheck:
+    # Always run against the latest stable Go to evaluate stdlib CVEs.
+    # If we used go.mod here, a dep that rewrites "go 1.25" to "go 1.25.0"
+    # would force setup-go to install exactly 1.25.0 — semver treats
+    # bare "1.25.0" as exact, not as ">=1.25.0" — and we'd light up
+    # every stdlib CVE patched in 1.25.x.
     name: govulncheck (Go CVEs in deps + stdlib)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-          # Always grab the latest patch matching the spec — guards
-          # against Dependabot rewriting "go 1.25" to "go 1.25.0",
-          # which otherwise pins us to the unpatched .0 release.
-          check-latest: true
+          go-version: stable
           cache: true
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -49,17 +48,15 @@ jobs:
         run: govulncheck ./...
 
   gosec:
+    # Latest stable Go: gosec itself frequently bumps its minimum Go,
+    # and reading from go.mod can leave us behind.
     name: gosec (static security analysis)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-          # Always grab the latest patch matching the spec — guards
-          # against Dependabot rewriting "go 1.25" to "go 1.25.0",
-          # which otherwise pins us to the unpatched .0 release.
-          check-latest: true
+          go-version: stable
           cache: true
       - name: Install gosec
         run: go install github.com/securego/gosec/v2/cmd/gosec@latest
