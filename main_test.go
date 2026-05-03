@@ -78,6 +78,12 @@ func TestAuth(t *testing.T) {
 		{"wrong token", "Bearer wrong-token", http.StatusUnauthorized},
 		{"missing Bearer prefix", testToken, http.StatusUnauthorized},
 		{"correct token", "Bearer " + testToken, http.StatusOK},
+		// Benign whitespace mistakes that should still authenticate.
+		// Without TrimSpace these silently fail with "invalid token"
+		// even though the token is correct.
+		{"double space after scheme", "Bearer  " + testToken, http.StatusOK},
+		{"trailing whitespace", "Bearer " + testToken + " ", http.StatusOK},
+		{"trailing tab", "Bearer " + testToken + "\t", http.StatusOK},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
