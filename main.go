@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -273,6 +274,14 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if !nameRe.MatchString(name) {
 		writeErr(w, http.StatusBadRequest, "invalid name")
+		return
+	}
+	// Reject anything that doesn't claim to be JSON. mime.ParseMediaType
+	// handles RFC-correct case-insensitivity ("Application/JSON") and
+	// strips parameters ("application/json; charset=utf-8" → ok).
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mt != "application/json" {
+		writeErr(w, http.StatusUnsupportedMediaType, "content-type must be application/json")
 		return
 	}
 	// Read one byte beyond the cap so an oversized body returns a clear

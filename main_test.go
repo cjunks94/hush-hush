@@ -177,6 +177,39 @@ func TestPut_BodyValidation(t *testing.T) {
 	}
 }
 
+// ---- PUT enforces Content-Type: application/json ----
+
+func TestPut_ContentTypeEnforcement(t *testing.T) {
+	_, h := newTestServer(t)
+	tests := []struct {
+		name  string
+		ctype string // empty = header not set
+		want  int
+	}{
+		{"application/json", "application/json", http.StatusOK},
+		{"json with charset", "application/json; charset=utf-8", http.StatusOK},
+		{"case insensitive per RFC", "Application/JSON", http.StatusOK},
+		{"missing content-type", "", http.StatusUnsupportedMediaType},
+		{"text/plain", "text/plain", http.StatusUnsupportedMediaType},
+		{"form encoded", "application/x-www-form-urlencoded", http.StatusUnsupportedMediaType},
+		{"text/json (incorrect mime)", "text/json", http.StatusUnsupportedMediaType},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("PUT", "/v1/secrets/ctype-test",
+				bytes.NewReader([]byte(`{"value":"x"}`)))
+			req.Header.Set("Authorization", "Bearer "+testToken)
+			if tt.ctype != "" {
+				req.Header.Set("Content-Type", tt.ctype)
+			}
+			rr := do(h, req)
+			if rr.Code != tt.want {
+				t.Errorf("got %d, want %d (body=%s)", rr.Code, tt.want, rr.Body.String())
+			}
+		})
+	}
+}
+
 // ---- Case 6 & 7: value-size boundary at maxValueBytes ----
 
 func TestPut_ValueSizeBoundary(t *testing.T) {
