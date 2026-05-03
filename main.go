@@ -34,6 +34,11 @@ const (
 
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,128}$`)
 
+// requestIDRe restricts inbound X-Request-ID values: permissive enough
+// for common formats (UUID, ULID, hex) but strict enough to defeat
+// log-injection (no CRLF, no quote, bounded length).
+var requestIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
+
 type server struct {
 	db            *sql.DB
 	gcm           cipher.AEAD
@@ -396,19 +401,29 @@ func (h *contextHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.Handler.Handle(ctx, r)
 }
 
-// withRequestID generates a 16-hex-char ID for each request, stashes
-// it in the request context, and echoes it in X-Request-ID so a client
-// can correlate a server log line to the response they received.
+// withRequestID resolves a request ID for each request, stashes it in
+// the request context, and echoes it in X-Request-ID so a client can
+// correlate a server log line to the response they received.
+//
+// Resolution order:
+//  1. Inbound X-Request-ID (e.g. an upstream Railway / CDN trace) if it
+//     passes requestIDRe — preserves end-to-end correlation.
+//  2. Fresh 16-hex-char value from crypto/rand.
+//  3. The string "rng-failed" as a last-resort sentinel so log lines
+//     are still correlatable instead of orphaned. rand.Read failing on
+//     Linux is essentially impossible but the empty-ID branch was a
+//     silent observability hole.
 func withRequestID(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b := make([]byte, 8)
-		if _, err := rand.Read(b); err != nil {
-			// rand.Read failing on Linux is essentially impossible;
-			// fall through with an empty ID rather than 500-ing the request.
-			h.ServeHTTP(w, r)
-			return
+		id := r.Header.Get("X-Request-ID")
+		if !requestIDRe.MatchString(id) {
+			b := make([]byte, 8)
+			if _, err := rand.Read(b); err == nil {
+				id = hex.EncodeToString(b)
+			} else {
+				id = "rng-failed"
+			}
 		}
-		id := hex.EncodeToString(b)
 		w.Header().Set("X-Request-ID", id)
 		ctx := context.WithValue(r.Context(), ctxKey{}, id)
 		h.ServeHTTP(w, r.WithContext(ctx))

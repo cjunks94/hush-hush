@@ -253,9 +253,21 @@ func TestList_EmptyArrayNotNull(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200", rr.Code)
 	}
-	body := rr.Body.String()
-	if !strings.Contains(body, `"secrets":[]`) {
-		t.Errorf("body should contain empty array, got: %s", body)
+	// Decode into a typed struct rather than string-matching the body.
+	// JSON `null` decodes to a nil slice; JSON `[]` decodes to an empty
+	// non-nil slice. The contract is the latter — clients can iterate
+	// without nil-checking.
+	var resp struct {
+		Secrets []secretRow `json:"secrets"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Secrets == nil {
+		t.Errorf("secrets must be [], not null/nil")
+	}
+	if len(resp.Secrets) != 0 {
+		t.Errorf("expected empty slice, got %d items", len(resp.Secrets))
 	}
 }
 
@@ -332,17 +344,90 @@ func TestGet_TamperedCiphertextRejected(t *testing.T) {
 	}
 }
 
-// ---- Bonus: aad() binds version byte AND name (called out by reviewer) ----
+// ---- aad() binds version byte AND name (unit-level helper test) ----
 
 func TestAAD_IncludesVersionAndName(t *testing.T) {
-	got := aad("hello")
-	if len(got) != 6 {
-		t.Fatalf("len(aad) = %d, want 6 (1 version + 5 name)", len(got))
+	const name = "hello"
+	got := aad(name)
+	want := 1 + len(name)
+	if len(got) != want {
+		t.Fatalf("len(aad) = %d, want %d (1 version + %d name)", len(got), want, len(name))
 	}
 	if got[0] != cryptoVersion {
 		t.Errorf("aad[0] = %#x, want %#x", got[0], cryptoVersion)
 	}
-	if string(got[1:]) != "hello" {
-		t.Errorf("aad[1:] = %q, want %q", string(got[1:]), "hello")
+	if string(got[1:]) != name {
+		t.Errorf("aad[1:] = %q, want %q", string(got[1:]), name)
 	}
+}
+
+// ---- AAD-binds-name as a runtime claim, not just a unit assertion ----
+//
+// Forge an attack: take name-a's stored ciphertext+nonce and overwrite
+// name-b's row with them. AAD = (cryptoVersion || name), so name-a's
+// AEAD tag does NOT authenticate under name-b. GET name-b must 500.
+func TestGet_CrossNameRebindingRejected(t *testing.T) {
+	s, h := newTestServer(t)
+
+	for name, val := range map[string]string{"name-a": "value-a", "name-b": "value-b"} {
+		body := []byte(`{"value":"` + val + `"}`)
+		if rr := do(h, authReq("PUT", "/v1/secrets/"+name, body)); rr.Code != http.StatusOK {
+			t.Fatalf("PUT %s: %d", name, rr.Code)
+		}
+	}
+
+	var ct, nonce []byte
+	if err := s.db.QueryRow(
+		`SELECT ciphertext, nonce FROM secrets WHERE name = ?`, "name-a",
+	).Scan(&ct, &nonce); err != nil {
+		t.Fatalf("read name-a: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE secrets SET ciphertext = ?, nonce = ? WHERE name = ?`, ct, nonce, "name-b",
+	); err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+
+	if rr := do(h, authReq("GET", "/v1/secrets/name-b", nil)); rr.Code != http.StatusInternalServerError {
+		t.Errorf("got %d, want 500 — moving ciphertext between names must fail AEAD verification", rr.Code)
+	}
+}
+
+// ---- withRequestID middleware behavior ----
+
+func TestRequestID_Middleware(t *testing.T) {
+	s, _ := newTestServer(t)
+	h := withRequestID(s.routes())
+
+	t.Run("generates 16-hex ID when none provided", func(t *testing.T) {
+		rr := do(h, httptest.NewRequest("GET", "/healthz", nil))
+		got := rr.Header().Get("X-Request-ID")
+		if len(got) != 16 {
+			t.Errorf("X-Request-ID = %q (len=%d), want 16-char hex", got, len(got))
+		}
+	})
+
+	t.Run("preserves valid inbound ID for end-to-end correlation", func(t *testing.T) {
+		const inbound = "01HK4P6V2ZR9G7X8F0D3M1ABCD"
+		req := httptest.NewRequest("GET", "/healthz", nil)
+		req.Header.Set("X-Request-ID", inbound)
+		rr := do(h, req)
+		if got := rr.Header().Get("X-Request-ID"); got != inbound {
+			t.Errorf("X-Request-ID = %q, want %q (inbound should pass through)", got, inbound)
+		}
+	})
+
+	t.Run("rejects malicious inbound ID and generates fresh", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/healthz", nil)
+		// Attempt log injection via newline / semicolons / quotes.
+		req.Header.Set("X-Request-ID", "evil\nfake_log_line; \"injected\"")
+		rr := do(h, req)
+		got := rr.Header().Get("X-Request-ID")
+		if got == "" {
+			t.Errorf("expected fresh fallback ID, got empty")
+		}
+		if strings.ContainsAny(got, "\n;\"") {
+			t.Errorf("malicious chars leaked through: %q", got)
+		}
+	})
 }
