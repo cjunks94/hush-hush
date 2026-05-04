@@ -1,9 +1,8 @@
 # hush-hush
 
 [![CI](https://github.com/cjunks94/hush-hush/actions/workflows/security.yml/badge.svg)](https://github.com/cjunks94/hush-hush/actions/workflows/security.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/cjunks94/hush-hush)](https://goreportcard.com/report/github.com/cjunks94/hush-hush)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cjunks94/hush-hush?v=2)](https://goreportcard.com/report/github.com/cjunks94/hush-hush)
 [![codecov](https://codecov.io/gh/cjunks94/hush-hush/branch/main/graph/badge.svg)](https://codecov.io/gh/cjunks94/hush-hush)
-[![Latest Release](https://img.shields.io/github/v/release/cjunks94/hush-hush?display_name=tag)](https://github.com/cjunks94/hush-hush/releases)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/cjunks94/hush-hush)](go.mod)
 [![License: MIT](https://img.shields.io/github/license/cjunks94/hush-hush)](LICENSE)
 
