@@ -1,5 +1,11 @@
 # hush-hush
 
+[![CI](https://github.com/cjunks94/hush-hush/actions/workflows/security.yml/badge.svg)](https://github.com/cjunks94/hush-hush/actions/workflows/security.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cjunks94/hush-hush)](https://goreportcard.com/report/github.com/cjunks94/hush-hush)
+[![codecov](https://codecov.io/gh/cjunks94/hush-hush/branch/main/graph/badge.svg)](https://codecov.io/gh/cjunks94/hush-hush)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/cjunks94/hush-hush)](go.mod)
+[![License: MIT](https://img.shields.io/github/license/cjunks94/hush-hush)](LICENSE)
+
 A minimal self-hosted secret keeper. Single Go binary, SQLite, HTTPS API, AES-256-GCM at rest. Deploys to Railway in five minutes, runs anywhere a Go binary can run.
 
 Built as a personal portfolio project — small enough to read in one sitting (~410 lines + tests), real enough to actually use.

@@ -9,5 +9,9 @@ hush-hush.exe
 /dist/
 /tmp/
 
+# Go coverage output
+coverage.out
+coverage.html
+
 # Claude Code per-user settings (shared settings.json may be committed; .local.json must not)
 .claude/settings.local.json

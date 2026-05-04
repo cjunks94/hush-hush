@@ -27,7 +27,14 @@ jobs:
       - run: go mod verify
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -coverprofile=coverage.out ./...
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          # Public repos don't need a token; private repos do. Don't
+          # break CI if the upload fails (e.g. Codecov unreachable).
+          fail_ci_if_error: false
 
   govulncheck:
     # Always run against the latest stable Go to evaluate stdlib CVEs.
