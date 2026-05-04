@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -476,4 +478,112 @@ func TestRequestID_Middleware(t *testing.T) {
 			t.Errorf("malicious chars leaked through: %q", got)
 		}
 	})
+}
+
+// ---- Env helpers ----
+//
+// mustEnv's missing-var path calls fatal() which exits the process, so we
+// only test the present-and-non-empty path. getenv has no fatal path, so
+// both branches are covered.
+
+func TestMustEnv(t *testing.T) {
+	const k = "HUSH_TEST_MUSTENV"
+	t.Setenv(k, "value")
+	if got := mustEnv(k); got != "value" {
+		t.Errorf("mustEnv = %q, want %q", got, "value")
+	}
+}
+
+func TestGetenv(t *testing.T) {
+	const k = "HUSH_TEST_GETENV"
+	t.Run("empty returns default", func(t *testing.T) {
+		t.Setenv(k, "")
+		if got := getenv(k, "fallback"); got != "fallback" {
+			t.Errorf("got %q, want %q", got, "fallback")
+		}
+	})
+	t.Run("set returns value", func(t *testing.T) {
+		t.Setenv(k, "actual")
+		if got := getenv(k, "fallback"); got != "actual" {
+			t.Errorf("got %q, want %q", got, "actual")
+		}
+	})
+}
+
+// ---- contextHandler attaches request_id from ctx ----
+
+// logEntry is a typed shape for asserting on slog JSON output. Pointer
+// for request_id distinguishes "absent" (nil) from "present-but-empty".
+type logEntry struct {
+	Msg       string  `json:"msg"`
+	RequestID *string `json:"request_id"`
+	Extra     string  `json:"extra"`
+}
+
+func TestContextHandler_AttachesRequestID(t *testing.T) {
+	var buf bytes.Buffer
+	h := &contextHandler{Handler: slog.NewJSONHandler(&buf, nil)}
+	logger := slog.New(h)
+
+	ctx := context.WithValue(context.Background(), ctxKey{}, "test-req-id-123")
+	logger.InfoContext(ctx, "test message", "extra", "field")
+
+	var entry logEntry
+	if err := json.NewDecoder(bytes.NewReader(buf.Bytes())).Decode(&entry); err != nil {
+		t.Fatalf("decode log json: %v", err)
+	}
+	if entry.RequestID == nil || *entry.RequestID != "test-req-id-123" {
+		t.Errorf("request_id = %v, want %q", entry.RequestID, "test-req-id-123")
+	}
+	if entry.Msg != "test message" {
+		t.Errorf("msg = %q, want %q", entry.Msg, "test message")
+	}
+}
+
+func TestContextHandler_NoIDWhenContextEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	h := &contextHandler{Handler: slog.NewJSONHandler(&buf, nil)}
+	logger := slog.New(h)
+
+	logger.InfoContext(context.Background(), "no-id message")
+
+	var entry logEntry
+	if err := json.NewDecoder(bytes.NewReader(buf.Bytes())).Decode(&entry); err != nil {
+		t.Fatalf("decode log json: %v", err)
+	}
+	if entry.RequestID != nil {
+		t.Errorf("request_id should be absent when ctx has no key, got: %q", *entry.RequestID)
+	}
+}
+
+// ---- DB error branches in handlers ----
+//
+// Closing the underlying *sql.DB makes subsequent queries return
+// "sql: database is closed", which exercises the db-error 500 paths
+// that are otherwise unreachable in tests.
+
+func TestHandler_DBErrorReturns500(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   []byte
+	}{
+		{"list", "GET", "/v1/secrets", nil},
+		{"get", "GET", "/v1/secrets/whatever", nil},
+		{"put", "PUT", "/v1/secrets/whatever", []byte(`{"value":"x"}`)},
+		{"delete", "DELETE", "/v1/secrets/whatever", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, h := newTestServer(t)
+			if err := s.db.Close(); err != nil {
+				t.Fatalf("close db: %v", err)
+			}
+			rr := do(h, authReq(tt.method, tt.path, tt.body))
+			if rr.Code != http.StatusInternalServerError {
+				t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
+			}
+		})
+	}
 }
