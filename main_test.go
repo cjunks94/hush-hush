@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -476,4 +478,116 @@ func TestRequestID_Middleware(t *testing.T) {
 			t.Errorf("malicious chars leaked through: %q", got)
 		}
 	})
+}
+
+// ---- Env helpers ----
+//
+// mustEnv's missing-var path calls fatal() which exits the process, so we
+// only test the present-and-non-empty path. getenv has no fatal path, so
+// both branches are covered.
+
+func TestMustEnv(t *testing.T) {
+	const k = "HUSH_TEST_MUSTENV"
+	t.Setenv(k, "value")
+	if got := mustEnv(k); got != "value" {
+		t.Errorf("mustEnv = %q, want %q", got, "value")
+	}
+}
+
+func TestGetenv(t *testing.T) {
+	const k = "HUSH_TEST_GETENV"
+	t.Run("empty returns default", func(t *testing.T) {
+		t.Setenv(k, "")
+		if got := getenv(k, "fallback"); got != "fallback" {
+			t.Errorf("got %q, want %q", got, "fallback")
+		}
+	})
+	t.Run("set returns value", func(t *testing.T) {
+		t.Setenv(k, "actual")
+		if got := getenv(k, "fallback"); got != "actual" {
+			t.Errorf("got %q, want %q", got, "actual")
+		}
+	})
+}
+
+// ---- contextHandler attaches request_id from ctx ----
+
+func TestContextHandler_AttachesRequestID(t *testing.T) {
+	var buf bytes.Buffer
+	h := &contextHandler{Handler: slog.NewJSONHandler(&buf, nil)}
+	logger := slog.New(h)
+
+	ctx := context.WithValue(context.Background(), ctxKey{}, "test-req-id-123")
+	logger.InfoContext(ctx, "test message", "extra", "field")
+
+	out := buf.String()
+	if !strings.Contains(out, `"request_id":"test-req-id-123"`) {
+		t.Errorf("expected request_id in output, got: %s", out)
+	}
+	if !strings.Contains(out, `"msg":"test message"`) {
+		t.Errorf("expected msg in output, got: %s", out)
+	}
+}
+
+func TestContextHandler_NoIDWhenContextEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	h := &contextHandler{Handler: slog.NewJSONHandler(&buf, nil)}
+	logger := slog.New(h)
+
+	logger.InfoContext(context.Background(), "no-id message")
+
+	out := buf.String()
+	if strings.Contains(out, `"request_id"`) {
+		t.Errorf("request_id should not appear when ctx has no key, got: %s", out)
+	}
+}
+
+// ---- DB error branches in handlers ----
+//
+// Closing the underlying *sql.DB makes subsequent queries return
+// "sql: database is closed", which exercises the db-error 500 paths
+// that are otherwise unreachable in tests.
+
+func TestList_DBErrorReturns500(t *testing.T) {
+	s, h := newTestServer(t)
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	rr := do(h, authReq("GET", "/v1/secrets", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGet_DBErrorReturns500(t *testing.T) {
+	s, h := newTestServer(t)
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	rr := do(h, authReq("GET", "/v1/secrets/whatever", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPut_DBErrorReturns500(t *testing.T) {
+	s, h := newTestServer(t)
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	rr := do(h, authReq("PUT", "/v1/secrets/whatever", []byte(`{"value":"x"}`)))
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDel_DBErrorReturns500(t *testing.T) {
+	s, h := newTestServer(t)
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	rr := do(h, authReq("DELETE", "/v1/secrets/whatever", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
+	}
 }
