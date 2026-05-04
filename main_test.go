@@ -512,6 +512,14 @@ func TestGetenv(t *testing.T) {
 
 // ---- contextHandler attaches request_id from ctx ----
 
+// logEntry is a typed shape for asserting on slog JSON output. Pointer
+// for request_id distinguishes "absent" (nil) from "present-but-empty".
+type logEntry struct {
+	Msg       string  `json:"msg"`
+	RequestID *string `json:"request_id"`
+	Extra     string  `json:"extra"`
+}
+
 func TestContextHandler_AttachesRequestID(t *testing.T) {
 	var buf bytes.Buffer
 	h := &contextHandler{Handler: slog.NewJSONHandler(&buf, nil)}
@@ -520,12 +528,15 @@ func TestContextHandler_AttachesRequestID(t *testing.T) {
 	ctx := context.WithValue(context.Background(), ctxKey{}, "test-req-id-123")
 	logger.InfoContext(ctx, "test message", "extra", "field")
 
-	out := buf.String()
-	if !strings.Contains(out, `"request_id":"test-req-id-123"`) {
-		t.Errorf("expected request_id in output, got: %s", out)
+	var entry logEntry
+	if err := json.NewDecoder(bytes.NewReader(buf.Bytes())).Decode(&entry); err != nil {
+		t.Fatalf("decode log json: %v", err)
 	}
-	if !strings.Contains(out, `"msg":"test message"`) {
-		t.Errorf("expected msg in output, got: %s", out)
+	if entry.RequestID == nil || *entry.RequestID != "test-req-id-123" {
+		t.Errorf("request_id = %v, want %q", entry.RequestID, "test-req-id-123")
+	}
+	if entry.Msg != "test message" {
+		t.Errorf("msg = %q, want %q", entry.Msg, "test message")
 	}
 }
 
@@ -536,9 +547,12 @@ func TestContextHandler_NoIDWhenContextEmpty(t *testing.T) {
 
 	logger.InfoContext(context.Background(), "no-id message")
 
-	out := buf.String()
-	if strings.Contains(out, `"request_id"`) {
-		t.Errorf("request_id should not appear when ctx has no key, got: %s", out)
+	var entry logEntry
+	if err := json.NewDecoder(bytes.NewReader(buf.Bytes())).Decode(&entry); err != nil {
+		t.Fatalf("decode log json: %v", err)
+	}
+	if entry.RequestID != nil {
+		t.Errorf("request_id should be absent when ctx has no key, got: %q", *entry.RequestID)
 	}
 }
 
@@ -548,46 +562,28 @@ func TestContextHandler_NoIDWhenContextEmpty(t *testing.T) {
 // "sql: database is closed", which exercises the db-error 500 paths
 // that are otherwise unreachable in tests.
 
-func TestList_DBErrorReturns500(t *testing.T) {
-	s, h := newTestServer(t)
-	if err := s.db.Close(); err != nil {
-		t.Fatalf("close db: %v", err)
+func TestHandler_DBErrorReturns500(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   []byte
+	}{
+		{"list", "GET", "/v1/secrets", nil},
+		{"get", "GET", "/v1/secrets/whatever", nil},
+		{"put", "PUT", "/v1/secrets/whatever", []byte(`{"value":"x"}`)},
+		{"delete", "DELETE", "/v1/secrets/whatever", nil},
 	}
-	rr := do(h, authReq("GET", "/v1/secrets", nil))
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
-	}
-}
-
-func TestGet_DBErrorReturns500(t *testing.T) {
-	s, h := newTestServer(t)
-	if err := s.db.Close(); err != nil {
-		t.Fatalf("close db: %v", err)
-	}
-	rr := do(h, authReq("GET", "/v1/secrets/whatever", nil))
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
-	}
-}
-
-func TestPut_DBErrorReturns500(t *testing.T) {
-	s, h := newTestServer(t)
-	if err := s.db.Close(); err != nil {
-		t.Fatalf("close db: %v", err)
-	}
-	rr := do(h, authReq("PUT", "/v1/secrets/whatever", []byte(`{"value":"x"}`)))
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
-	}
-}
-
-func TestDel_DBErrorReturns500(t *testing.T) {
-	s, h := newTestServer(t)
-	if err := s.db.Close(); err != nil {
-		t.Fatalf("close db: %v", err)
-	}
-	rr := do(h, authReq("DELETE", "/v1/secrets/whatever", nil))
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, h := newTestServer(t)
+			if err := s.db.Close(); err != nil {
+				t.Fatalf("close db: %v", err)
+			}
+			rr := do(h, authReq(tt.method, tt.path, tt.body))
+			if rr.Code != http.StatusInternalServerError {
+				t.Errorf("got %d, want 500 (body=%s)", rr.Code, rr.Body.String())
+			}
+		})
 	}
 }
