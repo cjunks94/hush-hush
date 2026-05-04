@@ -31,9 +31,10 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: cjunks94/hush-hush
           files: ./coverage.out
-          # Public repos don't need a token; private repos do. Don't
-          # break CI if the upload fails (e.g. Codecov unreachable).
+          # Don't break CI if the upload fails (Codecov unreachable, etc.)
           fail_ci_if_error: false
 
   govulncheck:
