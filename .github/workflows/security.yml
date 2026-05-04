@@ -78,6 +78,13 @@ jobs:
     # because Dependabot's GITHUB_TOKEN is read-only and the action
     # tries to write PR comments.
     if: github.event_name != 'pull_request' || github.actor != 'dependabot[bot]'
+    # gitleaks-action calls GET /repos/{owner}/{repo}/pulls/{n}/commits
+    # on pull_request events. The workflow's top-level permissions
+    # grant only contents: read, so this job needs an explicit
+    # pull-requests: read scope; without it the action 403s.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v6
         with:
