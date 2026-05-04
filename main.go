@@ -179,7 +179,12 @@ func (s *server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 		// Hash both sides so the compared slices are always 32 bytes;
 		// ConstantTimeCompare short-circuits on length mismatch and would
 		// otherwise leak the real token's length via timing.
-		given := strings.TrimPrefix(auth, "Bearer ")
+		//
+		// TrimSpace handles benign client mistakes (extra space after the
+		// scheme, trailing whitespace) per RFC 7230 §3.2.4 — without it,
+		// "Bearer  token" reaches the compare as " token" and silently
+		// 401s with a misleading "invalid token" instead of succeeding.
+		given := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 		givenHash := sha256.Sum256([]byte(given))
 		if subtle.ConstantTimeCompare(givenHash[:], s.authTokenHash[:]) != 1 {
 			writeErr(w, http.StatusUnauthorized, "invalid token")
